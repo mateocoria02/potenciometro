@@ -1,0 +1,149 @@
+#include <stdio.h>
+#include "pico/stdlib.h"
+#include "hardware/adc.h"
+#include <math.h>
+#include <stdlib.h>
+
+#define STEP_PIN 19
+#define DIR_PIN 18
+#define BUTTON_PIN 3
+
+#define POT_PIN 26       // Pin ADC para el potenciómetro del péndulo
+#define POT_PIN_KP 26    // Pin ADC para el potenciómetro de Kp
+#define POT_PIN_KI 27    // Pin ADC para el potenciómetro de Ki
+#define POT_PIN_KD 28    // Pin ADC para el potenciómetro de Kd
+
+#define THRESHOLD 0
+#define ADC_UPPER_LIMIT 3500
+#define ADC_LOWER_LIMIT 972
+
+volatile float equilibrium_position = 0.0;
+volatile bool is_equilibrium_set = false;
+volatile bool system_paused = false;
+
+float kp = 0.0, ki = 0.0, kd = 0.0;
+float integral_error = 0.0;
+float previous_error = 0.0;
+
+// Mapea valores del ADC (0-4095) al rango especificado
+float map_adc_to_range(uint16_t adc_value, float min_range, float max_range) {
+    return min_range + ((float)adc_value / 4095.0) * (max_range - min_range);
+}
+
+// Lee el ángulo del péndulo desde el ADC
+float read_pendulum_position() {
+    return adc_read() * 360.0 / 4096.0;
+}
+
+// Lee los valores de los potenciómetros para Kp, Ki y Kd
+void read_pid_constants() {
+    // Leer Kp
+    adc_select_input(0);
+    uint16_t adc_value_kp = adc_read();
+    kp = map_adc_to_range(adc_value_kp, 0.0, 20.0);
+
+    // Leer Ki
+    adc_select_input(1);
+    uint16_t adc_value_ki = adc_read();
+    ki = map_adc_to_range(adc_value_ki, 0.0, 5.0);
+
+    // Leer Kd
+    adc_select_input(2);
+    uint16_t adc_value_kd = adc_read();
+    kd = map_adc_to_range(adc_value_kd, 0.0, 2.0);
+
+    // Imprimir únicamente los valores actuales de Kp, Ki y Kd
+    printf("\rKp: %.2f, Ki: %.2f, Kd: %.2f                                                        ", kp, ki, kd);
+    fflush(stdout);
+}
+
+void setup() {
+    stdio_init_all();
+
+    gpio_init(STEP_PIN);
+    gpio_set_dir(STEP_PIN, GPIO_OUT);
+    gpio_put(STEP_PIN, 0);
+
+    gpio_init(DIR_PIN);
+    gpio_set_dir(DIR_PIN, GPIO_OUT);
+    gpio_put(DIR_PIN, 0);
+
+    gpio_init(BUTTON_PIN);
+    gpio_set_dir(BUTTON_PIN, GPIO_IN);
+    gpio_pull_down(BUTTON_PIN);
+
+    adc_init();
+    adc_gpio_init(POT_PIN_KP);
+    adc_gpio_init(POT_PIN_KI);
+    adc_gpio_init(POT_PIN_KD);
+    adc_gpio_init(POT_PIN);
+}
+
+void button_callback(uint gpio, uint32_t events) {
+    if (gpio == BUTTON_PIN && (events & GPIO_IRQ_EDGE_FALL)) {
+        equilibrium_position = read_pendulum_position();
+        is_equilibrium_set = true;
+        system_paused = false;
+        integral_error = 0.0;
+        previous_error = 0.0;
+    }
+}
+
+void control_motor(float error) {
+    integral_error += error * 0.001;
+    float derivative_error = (error - previous_error) / 0.001;
+    float control_signal = (kp * error) + (ki * integral_error) + (kd * derivative_error);
+
+    // Limitar el control para evitar valores extremos
+    if (fabs(control_signal) > 1500) {
+        control_signal = 1500;
+    }
+
+    // Controlar el motor solo si el error es significativo
+    if (fabs(error) > THRESHOLD) {
+        gpio_put(DIR_PIN, control_signal > 0 ? 1 : 0);
+
+        for (int i = 0; i < 4; i++) {
+            gpio_put(STEP_PIN, 1);
+            sleep_us(1);
+            gpio_put(STEP_PIN, 0);
+            sleep_us(1500 - fabs(control_signal));
+        }
+    }
+
+    previous_error = error;
+}
+
+int main() {
+    setup();
+    gpio_set_irq_enabled_with_callback(BUTTON_PIN, GPIO_IRQ_EDGE_FALL, true, &button_callback);
+
+    while (true) {
+        read_pid_constants();  // Leer e imprimir valores PID
+
+        if (system_paused) {
+            sleep_ms(100);
+            continue;
+        }
+
+        float current_position = read_pendulum_position();
+        uint16_t adc_value = adc_read();
+
+        // Verificar si el péndulo se ha caído
+        if (adc_value > ADC_UPPER_LIMIT || adc_value < ADC_LOWER_LIMIT) {
+            system_paused = true;
+            is_equilibrium_set = false;
+            continue;
+        }
+
+        // Controlar el motor si la posición de equilibrio está configurada
+        if (is_equilibrium_set) {
+            float error = equilibrium_position - current_position;
+            control_motor(error);
+        }
+
+        sleep_ms(100);
+    }
+
+    return 0;
+}
